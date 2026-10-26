@@ -16,8 +16,10 @@ npm run dev
 
 Open **http://localhost:3000**.
 
-- **No API key needed.** The built-in heuristic engine runs offline and answers instantly. The header shows `Engine: heuristic-engine`.
-- **Optional AI engine:** put a real key in `.env` as `GEMINI_API_KEY="..."`, then restart. The server tries Gemini first (2.5 s timeout) and falls back to the heuristic engine if it fails.
+- **No API key needed.** The built-in offline engine parses your HTML, finds the element you describe, and returns only locators it has verified match exactly one element. The header shows `Engine: heuristic-engine`.
+- **Optional Gemini engine:** put your key in `.env` as `GEMINI_API_KEY="..."` and restart. Both key types work: Google AI Studio keys (`AIza...`) and Vertex AI express-mode keys (`AQ....`, detected automatically). Gemini is tried first; its XPath is checked against your HTML, and if it is wrong or Gemini is unreachable the offline engine answers and the header shows `(Gemini unavailable)`.
+- **Gemini settings (optional):** `GEMINI_MODEL` (default `gemini-2.5-flash`) and `GEMINI_TIMEOUT_MS` (default `20000`).
+- **Never commit or share your `.env`.** It is git-ignored; the exported ZIP does not include it.
 - **Port:** set `PORT=4000` in `.env` or the shell to change it.
 - **Production:** `npm run build`, then `NODE_ENV=production npm run dev` serves the built `dist/`.
 
@@ -42,7 +44,7 @@ Open **http://localhost:3000**.
 | **Confidence** | The engine's certainty, 0-100%. |
 | **In-Browser DOM Match** | The XPath is run against your pasted HTML. You want **1 Unique Match**. 0 or many matches means the locator needs work. |
 | **Architect's Rationale** | A short explanation of why this locator won. |
-| **Resilience Indicator** | Letter grade A+ to F, a stability score, flakiness risk, and per-factor scores (attribute durability, DOM independence, whitespace defence). Low grades come with tips and an **Auto-Upgrade** button. |
+| **Resilience Indicator** | Letter grade A+ to F, a stability score, flakiness risk, and per-factor scores (attribute durability, DOM independence, whitespace defence). Low grades come with tips and a suggested more-stable locator. |
 | **Alternative selectors** | Backup XPaths, an equivalent CSS selector, and the Playwright semantic locator (`getByRole`, `getByTestId`...). Each has **Copy**, **Test** and **Inspect**. |
 | **Live XPath Tester** | Type or tweak any XPath and click **Evaluate** to see the match count and matched nodes. |
 | **Framework snippets** | Code for Playwright (TS), Selenium (Java), Selenium (Python), Cypress, Robot Framework and Puppeteer. Pick a tab, then **Copy Snippet**. |
@@ -118,21 +120,31 @@ curl -X POST http://localhost:3000/api/fetch-url \
 
 ---
 
-## 7. Tips and known limitations
+## 7. Writing good requests
 
-- Always check the **DOM Match** badge. Treat anything other than "1 Unique Match" as a draft.
-- Include enough HTML for the target and its surrounding context (labels, row, parent form). Anchors the engine can't see can't be used.
-- For repeated elements (table rows, lists), name the row in the request ("delete button for John Doe") and confirm uniqueness in the tester.
-- The offline engine is rule-based. On ambiguous markup the Gemini engine gives better reasoning.
-- Shadow DOM and iframe content can't be matched by plain XPath; use the Playwright/Selenium snippets that pierce or switch frames.
+The engine splits a request into **what you want** and **where it is**:
+
+- `Find the delete button for John Doe in the table` -> target: delete button; context: John Doe's row.
+- `Find the card number input inside the payment iframe` -> target: card number input; context: the iframe.
+- Use words that appear on the element: its visible text, label, placeholder, `aria-label`, or test id.
+- Name the element type (button, link, input, checkbox, dropdown, option, alert/toast, iframe, image, heading). It sharply improves ranking.
+- Say "submit button" to target a form's submit control even if its text is unusual.
+- If nothing matches, the app says so (confidence 10%, grade F) instead of guessing. Add more HTML or use words from the page.
+
+## 8. Tips and known limitations
+
+- Always check the **DOM Match** badge. "1 Unique Match" means the locator was verified against your HTML.
+- Include enough HTML for the target and its surrounding context (labels, row, parent form).
+- Plain XPath cannot cross a real **Shadow DOM** or **iframe** boundary. For those the app returns host/frame-scoped XPaths (the frame content is inlined for verification) plus Playwright locators that do pierce or switch frames.
+- Locators are checked against the HTML you paste, not the live page. JavaScript-rendered pages should be pasted from DevTools (*Copy outerHTML*).
 - A grade below B usually means missing `data-testid` attributes. Adding them to your app is the best fix.
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | `npm install` fails with `ERESOLVE` on `esbuild` | Use the updated `package.json` (esbuild `^0.28.0`), or run `npm install --legacy-peer-deps`. |
-| Header says `heuristic-engine`, not Gemini | `GEMINI_API_KEY` is missing, a placeholder, or Gemini timed out. Check `.env` and restart. |
+| Header says `heuristic-engine (Gemini unavailable)` | The key is wrong, the model name is not available to your key, or the server cannot reach Google. See the server log line `Gemini API Error:` for the reason. The offline engine still works. |
 | Fetch URL says "fetch failed" | The server machine cannot reach that site (network, proxy, or firewall). Paste the HTML manually. |
 | Port already in use | Set `PORT` to another value. |
 | Type errors | Run `npm run lint`. |

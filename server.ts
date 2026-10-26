@@ -5,6 +5,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
 import JSZip from 'jszip';
+import { generateHeuristicSelector, countXPathMatches } from './src/engine/heuristic.ts';
 
 dotenv.config();
 
@@ -16,15 +17,15 @@ const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
-// Initialize Gemini Client
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    },
-  },
-});
+// Initialize Gemini Client.
+// Keys starting with "AQ." are Vertex AI express-mode keys; everything else is a Gemini Developer API key.
+const GEMINI_KEY = (process.env.GEMINI_API_KEY || '').trim();
+const IS_VERTEX_KEY = GEMINI_KEY.startsWith('AQ.');
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_TIMEOUT_MS = parseInt(process.env.GEMINI_TIMEOUT_MS || '20000', 10);
+const ai = new GoogleGenAI(
+  IS_VERTEX_KEY ? { vertexai: true, apiKey: GEMINI_KEY } : { apiKey: GEMINI_KEY || 'unset' }
+);
 
 export interface CopilotResult {
   target_functionality: string;
@@ -187,8 +188,8 @@ app.post('/api/generate-xpath', async (req: Request, res: Response) => {
     return;
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  const isKeyConfigured = apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey.length > 5;
+  const isKeyConfigured = GEMINI_KEY.length > 5 && GEMINI_KEY !== 'MY_GEMINI_API_KEY' && !/your-gemini-api-key/i.test(GEMINI_KEY);
+  let geminiError = '';
 
   // Attempt Gemini API call if real key is present
   if (isKeyConfigured) {
@@ -196,11 +197,11 @@ app.post('/api/generate-xpath', async (req: Request, res: Response) => {
       const prompt = `HTML Snippet:\n\`\`\`html\n${html}\n\`\`\`\n\nTarget Functionality / Element Request:\n"${targetFunctionality}"\n\nGenerate the single BEST resilient XPath and alternatives according to the strict priority hierarchy and return ONLY the JSON object.`;
 
       const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Gemini API request timed out after 2500ms')), 2500)
+        setTimeout(() => reject(new Error(`Gemini API request timed out after ${GEMINI_TIMEOUT_MS}ms`)), GEMINI_TIMEOUT_MS)
       );
 
       const geminiPromise = ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: GEMINI_MODEL,
         contents: prompt,
         config: {
           systemInstruction: SYSTEM_INSTRUCTION,
@@ -258,30 +259,31 @@ app.post('/api/generate-xpath', async (req: Request, res: Response) => {
       const response = await Promise.race([geminiPromise, timeoutPromise]);
 
       const text = response.text?.trim() || '';
+      let parsed: any;
       try {
-        const parsed = JSON.parse(text);
-        res.json({
-          success: true,
-          data: parsed,
-          source: 'gemini-3.8-flash',
-        });
-        return;
-      } catch (e) {
-        // Fallback to extracting JSON block if text was enclosed
+        parsed = JSON.parse(text);
+      } catch {
         const match = text.match(/\{[\s\S]*\}/);
-        if (match) {
-          const parsed = JSON.parse(match[0]);
-          res.json({
-            success: true,
-            data: parsed,
-            source: 'gemini-3.8-flash',
-          });
-          return;
-        }
-        throw new Error('Unable to parse JSON from AI response: ' + text);
+        if (!match) throw new Error('Unable to parse JSON from AI response: ' + text.slice(0, 200));
+        parsed = JSON.parse(match[0]);
       }
+      if (!parsed || typeof parsed.best_xpath !== 'string') throw new Error('AI response missing best_xpath');
+
+      // Never trust the model blindly: verify its XPath against the supplied HTML.
+      const n = countXPathMatches(html, parsed.best_xpath);
+      if (n !== 1) {
+        const alt = (Array.isArray(parsed.alternative_xpaths) ? parsed.alternative_xpaths : []).find(
+          (x: any) => typeof x === 'string' && countXPathMatches(html, x) === 1
+        );
+        if (!alt) throw new Error(`Gemini XPath matched ${n} elements (expected exactly 1)`);
+        parsed.alternative_xpaths = [parsed.best_xpath, ...parsed.alternative_xpaths.filter((x: string) => x !== alt)].slice(0, 3);
+        parsed.best_xpath = alt;
+      }
+      res.json({ success: true, data: parsed, source: GEMINI_MODEL });
+      return;
     } catch (err: any) {
-      console.error('Gemini API Error:', err);
+      geminiError = String(err?.message || err).slice(0, 300);
+      console.error('Gemini API Error:', geminiError);
       // Fall through to heuristic fallback
     }
   }
@@ -292,258 +294,11 @@ app.post('/api/generate-xpath', async (req: Request, res: Response) => {
     success: true,
     data: fallbackResult,
     source: 'heuristic-engine',
-    note: process.env.GEMINI_API_KEY
-      ? 'Evaluated via internal DOM hierarchy analyzer (Gemini fallback)'
-      : 'Evaluated via internal DOM hierarchy analyzer',
+    note: isKeyConfigured
+      ? `Gemini unavailable (${geminiError}); used the offline DOM engine.`
+      : 'Offline DOM engine (no GEMINI_API_KEY set).',
   });
 });
-
-// Heuristic selector generator when offline or as instant pre-parser
-function generateHeuristicSelector(html: string, query: string): CopilotResult {
-  const cleanQuery = query.toLowerCase();
-
-  // Special Case 1: Table row relative navigation (Tier 4 Axis Traversal)
-  // e.g. "Find the delete button for John Doe in the table"
-  const personMatch = cleanQuery.match(/(john doe|alice smith|sarah connor)/i);
-  const actionMatch = cleanQuery.match(/(delete|edit|view|remove)/i);
-  if (personMatch && actionMatch) {
-    const person = personMatch[0];
-    const action = actionMatch[0].charAt(0).toUpperCase() + actionMatch[0].slice(1);
-    const properPerson = person.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-    
-    return {
-      target_functionality: query,
-      best_xpath: `//tr[contains(., '${properPerson}')]//button[normalize-space()='${action}']`,
-      strategy_used: 'Relational & Axis Navigation',
-      alternative_xpaths: [
-        `//td[normalize-space()='${properPerson}']/following-sibling::td//button[normalize-space()='${action}']`,
-        `//tr[td[normalize-space()='${properPerson}']]//button[contains(@aria-label, '${action}') or normalize-space()='${action}']`,
-      ],
-      alternative_css_selector: null,
-      playwright_semantic_locator: `page.getByRole('row', { name: '${properPerson}' }).getByRole('button', { name: '${action}' })`,
-      confidence_score: '0.94',
-      explanation: `Anchored to stable row contents matching '${properPerson}' and traversed to the inner '${action}' button, avoiding volatile table row indices.`,
-    };
-  }
-
-  // Special Case 2: Label to Input Axis Traversal (Tier 4 Axis)
-  // e.g. "Find the email input field next to the Corporate Work Email label"
-  const labelMatches = Array.from(html.matchAll(/<label[^>]*>\s*([^<]+?)\s*<\/label>/gi));
-  for (const m of labelMatches) {
-    const labelText = m[1].trim();
-    if (cleanQuery.includes(labelText.toLowerCase()) || 
-       (cleanQuery.includes('email') && labelText.toLowerCase().includes('email')) ||
-       (cleanQuery.includes('pin') && labelText.toLowerCase().includes('pin')) ||
-       (cleanQuery.includes('city') && labelText.toLowerCase().includes('city')) ||
-       (cleanQuery.includes('postal') && labelText.toLowerCase().includes('postal'))) {
-      
-      return {
-        target_functionality: query,
-        best_xpath: `//label[normalize-space()='${labelText}']/following-sibling::input[1]`,
-        strategy_used: 'Relational & Axis Navigation',
-        alternative_xpaths: [
-          `//label[contains(normalize-space(),'${labelText}')]/..//input`,
-          `//input[@placeholder and preceding-sibling::label[contains(.,'${labelText}')]]`,
-        ],
-        alternative_css_selector: null,
-        playwright_semantic_locator: `page.getByLabel('${labelText}')`,
-        confidence_score: '0.89',
-        explanation: `Located stable semantic <label> anchor with normalize-space()='${labelText}' and traversed along following-sibling axis to retrieve the adjacent input.`,
-      };
-    }
-  }
-
-  // Special Case 3: SVG Icon & Namespace Trap (Classic QA Scenario)
-  // e.g. "Find the Play audio track button with SVG icon" or "Find the Settings configuration icon button"
-  if (cleanQuery.includes('svg') || cleanQuery.includes('icon') || cleanQuery.includes('play') || cleanQuery.includes('track') || cleanQuery.includes('settings')) {
-    const ariaMatch = html.match(/<button[^>]*aria-label=["']([^"']*(?:play|settings|track|next|prev)[^"']*)["'][^>]*>/i);
-    if (ariaMatch) {
-      const label = ariaMatch[1];
-      return {
-        target_functionality: query,
-        best_xpath: `//button[@aria-label='${label}']`,
-        strategy_used: 'Accessible Name & SVG Namespace Traversal',
-        alternative_xpaths: [
-          `//button[contains(@aria-label, '${label}')]//*[local-name()='svg']`,
-          `//button[@aria-label='${label}']/*[name()='svg']`,
-        ],
-        alternative_css_selector: `button[aria-label="${label}"]`,
-        playwright_semantic_locator: `page.getByRole('button', { name: '${label}' })`,
-        confidence_score: '0.96',
-        explanation: `Used standard accessible name @aria-label='${label}' to bypass the classic XML //svg namespace trap and ensure resilient icon button detection.`,
-      };
-    }
-  }
-
-  // Special Case 4: Toast / Snackbar / Alert Dynamic Elements
-  // e.g. "Find the Sync Completed Successfully toast alert"
-  if (cleanQuery.includes('toast') || cleanQuery.includes('alert') || cleanQuery.includes('notification') || cleanQuery.includes('sync')) {
-    if (html.includes('role="alert"') || html.includes("role='alert'")) {
-      return {
-        target_functionality: query,
-        best_xpath: `//*[@role='alert']`,
-        strategy_used: 'WAI-ARIA Semantic Role (role="alert")',
-        alternative_xpaths: [
-          `//*[@data-testid='toast-success-banner']`,
-          `//*[contains(normalize-space(), 'Sync Completed Successfully')]`,
-        ],
-        alternative_css_selector: `[role="alert"]`,
-        playwright_semantic_locator: `page.getByRole('alert')`,
-        confidence_score: '0.98',
-        explanation: `Targeted WAI-ARIA role="alert", which is recognized across all modern automation runners and handles asynchronous UI toast lifecycles.`,
-      };
-    }
-  }
-
-  // Special Case 5: Combobox / Listbox Options
-  // e.g. "Find the United States option in the country listbox"
-  if (cleanQuery.includes('united states') || cleanQuery.includes('option') || cleanQuery.includes('combobox')) {
-    const countryMatch = cleanQuery.match(/(united states|united kingdom|united arab emirates)/i);
-    const country = countryMatch ? countryMatch[0] : 'United States';
-    return {
-      target_functionality: query,
-      best_xpath: `//li[@role='option'][contains(normalize-space(), '${country}')]`,
-      strategy_used: 'ARIA Role Listbox & Text Normalization',
-      alternative_xpaths: [
-        `//*[@role='listbox']//li[contains(., '${country}')]`,
-        `//li[@role='option'][@aria-selected='true']`,
-      ],
-      alternative_css_selector: `[role="option"]:has-text("${country}")`,
-      playwright_semantic_locator: `page.getByRole('option', { name: '${country}' })`,
-      confidence_score: '0.95',
-      explanation: `Selected option within ARIA listbox via role="option" and normalize-space(), shielding against custom framework dropdown wrappers.`,
-    };
-  }
-
-  // Special Case 6: Embedded iFrames & Payment Gateway
-  // e.g. "Find the Stripe payment iframe element" or "Find the card number input inside payment iframe"
-  if (cleanQuery.includes('iframe') || cleanQuery.includes('stripe') || cleanQuery.includes('card number')) {
-    if (cleanQuery.includes('card') && cleanQuery.includes('input')) {
-      return {
-        target_functionality: query,
-        best_xpath: `//iframe[@id='stripe-card-element-iframe']//input[@id='card-number']`,
-        strategy_used: 'iFrame Context Traversal',
-        alternative_xpaths: [
-          `//iframe[@data-testid='stripe-iframe']//input[@name='cardnumber']`,
-          `//input[@data-elements-stable-field-name='cardNumber']`,
-        ],
-        alternative_css_selector: `#stripe-card-element-iframe input#card-number`,
-        playwright_semantic_locator: `page.frameLocator('#stripe-card-element-iframe').locator('#card-number')`,
-        confidence_score: '0.93',
-        explanation: `Composed frame-switched locator targeting the isolated payment iframe with Playwright frameLocator() and Selenium frame switch.`,
-      };
-    }
-  }
-
-  // Tier 1: Targeted QA Attributes (data-testid, data-qa, data-cy)
-  const qaRegex = /(data-(?:testid|qa|cy|test))=["']([^"']+)["']/gi;
-  const qaMatches = Array.from(html.matchAll(qaRegex));
-
-  // Find QA attribute that matches query intent
-  let matchedQA: { attr: string; val: string } | null = null;
-  for (const m of qaMatches) {
-    const attr = m[1];
-    const val = m[2];
-    const valTokens = val.toLowerCase().replace(/[-_]/g, ' ').split(' ');
-    if (valTokens.some(t => t.length > 2 && cleanQuery.includes(t))) {
-      matchedQA = { attr, val };
-      break;
-    }
-  }
-
-  // Fallback to first QA match if query asks generally for submit or main target
-  if (!matchedQA && qaMatches.length > 0) {
-    if (cleanQuery.includes('submit') || cleanQuery.includes('order') || cleanQuery.includes('button')) {
-      const btnQA = qaMatches.find(m => m[2].includes('submit') || m[2].includes('order') || m[2].includes('btn'));
-      if (btnQA) matchedQA = { attr: btnQA[1], val: btnQA[2] };
-    }
-    if (!matchedQA && qaMatches[0]) {
-      matchedQA = { attr: qaMatches[0][1], val: qaMatches[0][2] };
-    }
-  }
-
-  if (matchedQA) {
-    const { attr, val } = matchedQA;
-    return {
-      target_functionality: query,
-      best_xpath: `//*[@${attr}='${val}']`,
-      strategy_used: 'Standard QA Attribute (Gold Standard)',
-      alternative_xpaths: [
-        `//*[contains(@${attr}, '${val}')]`,
-        `//button[@${attr}='${val}'] | //input[@${attr}='${val}']`,
-      ],
-      alternative_css_selector: `[${attr}="${val}"]`,
-      playwright_semantic_locator: `page.getByTestId('${val}')`,
-      confidence_score: '0.99',
-      explanation: `Found explicit test attribute '${attr}="${val}"', which ranks #1 in stability hierarchy and guarantees zero DOM breakage on styling updates.`,
-    };
-  }
-
-  // Tier 2: Static Unique ID or Name
-  const idMatches = Array.from(html.matchAll(/id=["']([a-zA-Z0-9_\-]+)["']/gi));
-  const validIds = idMatches
-    .map(m => m[1])
-    .filter(id => !(/[0-9a-f]{6,}/i.test(id) || /^(css-|sc-|jsx-)/i.test(id)));
-
-  for (const id of validIds) {
-    const idTokens = id.toLowerCase().replace(/[-_]/g, ' ').split(' ');
-    if (idTokens.some(t => t.length > 2 && cleanQuery.includes(t))) {
-      const tagMatch = html.match(new RegExp(`<([a-zA-Z0-9]+)[^>]*id=["']${id}["']`, 'i'));
-      const tag = tagMatch ? tagMatch[1] : '*';
-      return {
-        target_functionality: query,
-        best_xpath: `//${tag}[@id='${id}']`,
-        strategy_used: 'Unique Persistent Attribute',
-        alternative_xpaths: [
-          `//*[@id='${id}']`,
-          `//${tag}[contains(@id, '${id}')]`,
-        ],
-        alternative_css_selector: `#${id}`,
-        playwright_semantic_locator: `page.locator('#${id}')`,
-        confidence_score: '0.95',
-        explanation: `Located persistent static ID '${id}' on <${tag}>, satisfying tier 2 unique attribute rules without relying on ephemeral class hashes.`,
-      };
-    }
-  }
-
-  // Tier 3: Semantic Visible Text with Space Normalization
-  const buttonOrLinkRegex = /<(button|a|span)[^>]*>\s*([^<]+?)\s*<\/(?:button|a|span)>/gi;
-  const textMatches = Array.from(html.matchAll(buttonOrLinkRegex));
-  for (const m of textMatches) {
-    const tag = m[1];
-    const text = m[2].trim();
-    if (text.length > 1 && cleanQuery.includes(text.toLowerCase())) {
-      return {
-        target_functionality: query,
-        best_xpath: `//${tag}[normalize-space()='${text}']`,
-        strategy_used: 'Semantic Text & Space Normalization',
-        alternative_xpaths: [
-          `//${tag}[contains(normalize-space(), '${text}')]`,
-          `//*[normalize-space()='${text}']`,
-        ],
-        alternative_css_selector: null,
-        playwright_semantic_locator: `page.getByRole('${tag === 'button' ? 'button' : 'link'}', { name: '${text}' })`,
-        confidence_score: '0.91',
-        explanation: `Leveraged visible inner text with normalize-space()='${text}' to defend against whitespace differences and indentation changes in markup.`,
-      };
-    }
-  }
-
-  // Tier 5: Partial Matching on Semi-dynamic Attribute
-  return {
-    target_functionality: query,
-    best_xpath: `//button[contains(@id, 'btn')] | //input[contains(@placeholder, '${cleanQuery.slice(0, 10)}')]`,
-    strategy_used: 'Partial Match & Normalization',
-    alternative_xpaths: [
-      `//*[contains(normalize-space(), '${cleanQuery.slice(0, 12)}')]`,
-      `//input[1]`,
-    ],
-    alternative_css_selector: 'button, input',
-    playwright_semantic_locator: `page.locator('button, input').first()`,
-    confidence_score: '0.80',
-    explanation: `Constructed resilient locator using partial matching on stable prefix patterns and normalized visible tokens.`,
-  };
-}
 
 // Dev and Prod Vite server integration
 async function startServer() {

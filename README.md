@@ -2,6 +2,8 @@
 
 Production-grade XPath, CSS selector, and Playwright semantic locator generator for test automation engineers across **Selenium**, **Playwright**, and **Cypress**.
 
+> 📘 New to the tool? See **[HOW_TO_USE.md](./HOW_TO_USE.md)** for the full usage guide.
+
 ---
 
 ## 🚀 Quick Start Guide (VS Code)
@@ -25,16 +27,16 @@ npm install
 
 ### Step 3: Environment Setup (Optional)
 The application includes a dual-engine architecture:
-- **Instant AST / DOM Heuristic Engine**: Runs 100% offline with zero configuration and sub-50ms latency.
-- **Gemini 3.8 Flash AI Engine**: Provides deep contextual reasoning when an API key is provided.
+- **Offline DOM Engine**: Parses your HTML, scores every element against your request and verifies each locator matches exactly one element. Runs 100% offline with zero configuration.
+- **Gemini AI Engine (optional)**: Provides deeper contextual reasoning when an API key is provided. Its XPath is always verified against your HTML before display; if it fails, the offline engine answers instead.
 
 To enable the Gemini AI engine, create a `.env` file:
 ```bash
 cp .env.example .env
 ```
-And set your Gemini API key:
+And set your key (Google AI Studio `AIza...` keys and Vertex AI express `AQ....` keys are both supported):
 ```env
-GEMINI_API_KEY="your-gemini-api-key-here"
+GEMINI_API_KEY="your-key-here"
 ```
 
 ### Step 4: Start the Application
@@ -68,7 +70,7 @@ Open your browser and navigate to:
 2. **Resilience Indicator UI**:
    - Assigns a letter grade (**A+ to F**) and stability score (0–100%) based on reliance on volatile attributes versus stable test IDs.
    - Evaluates Attribute Durability, DOM Independence, and Whitespace Defense.
-   - Actionable stability improvement tips and a 1-click **Auto-Upgrade to Grade A** button.
+   - Actionable stability tips and a suggested more-stable replacement locator.
 
 3. **Full Testing World Scenarios Catalog**:
    - **Dynamic Data Tables**: Relative row/cell traversal (`following-sibling::`, `parent::tr`).
