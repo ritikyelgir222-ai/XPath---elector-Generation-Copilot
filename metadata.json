@@ -1,0 +1,6 @@
+{
+  "name": "XPath & Selector Generation Copilot",
+  "description": "Production-grade XPath, CSS selector, and Playwright semantic locator generator for test automation engineers across Selenium, Playwright, and Cypress.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
